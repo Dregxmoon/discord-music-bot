@@ -18,9 +18,12 @@
   },
   "homepage": "https://github.com/Dregxmoon/discord-music-bot#readme",
   "dependencies": {
+    "@discordjs/opus": "^0.10.0",
+    "@discordjs/rest": "^2.6.1",
     "@discordjs/voice": "^0.19.2",
     "discord.js": "^14.26.4",
-    "dotenv": "^17.4.2"
+    "dotenv": "^17.4.2",
+    "play-dl": "^1.9.7"
   },
   "devDependencies": {
     "@types/node": "^25.9.0",

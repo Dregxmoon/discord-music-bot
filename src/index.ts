@@ -1,50 +1,56 @@
-import {
-  Client,
-  GatewayIntentBits,
-  Interaction
-} from "discord.js";
-
+import { Client, GatewayIntentBits, Interaction } from "discord.js";
 import dotenv from "dotenv";
+
 dotenv.config();
 
-import { pingCommand } from "./commands/ping";
+import { createLavalinkClient } from "./lavalink/client";
 
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildVoiceStates
-  ]
+    GatewayIntentBits.GuildVoiceStates,
+  ],
 });
 
-const commands = {
-  ping: pingCommand
-};
+let lavalink: any;
 
 client.once("ready", () => {
   console.log(`✅ Bot listo como ${client.user?.tag}`);
+  lavalink = createLavalinkClient(client);
 });
 
 client.on("interactionCreate", async (interaction: Interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
-  const command = commands[interaction.commandName as keyof typeof commands];
-
-  if (!command) return;
+  const { commandName } = interaction;
 
   try {
-    await command.execute(interaction);
-  } catch (error) {
-    console.error(error);
+    switch (commandName) {
+      case "ping":
+        await interaction.reply("🏓 Pong!");
+        break;
 
-    if (interaction.replied || interaction.deferred) {
-      await interaction.followUp({
-        content: "❌ Error ejecutando comando",
-        ephemeral: true
-      });
-    } else {
+      case "play":
+        await interaction.reply("🎵 /play aún no conectado a lógica (siguiente paso)");
+        break;
+
+      case "skip":
+        await interaction.reply("⏭ Skip aún no implementado");
+        break;
+
+      case "stop":
+        await interaction.reply("⏹ Stop aún no implementado");
+        break;
+
+      default:
+        await interaction.reply("❓ Comando desconocido");
+    }
+  } catch (err) {
+    console.error(err);
+    if (interaction.isRepliable()) {
       await interaction.reply({
         content: "❌ Error ejecutando comando",
-        ephemeral: true
+        ephemeral: true,
       });
     }
   }

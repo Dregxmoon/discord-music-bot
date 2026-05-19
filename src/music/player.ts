@@ -3,14 +3,33 @@ import { TextChannel, VoiceBasedChannel } from "discord.js";
 import { queues } from "./queue";
 
 function getNode(shoukaku: Shoukaku) {
-  const node = shoukaku.options.nodeResolver(shoukaku.nodes);
+  const node = shoukaku.nodes.get("main");
   if (!node) throw new Error("No Lavalink node available");
   return node;
 }
 
 /**
- * 🎵 PLAY (add to queue or start)
+ * 🎧 SOLO crea player si no existe
  */
+async function getOrCreatePlayer(
+  shoukaku: Shoukaku,
+  guildId: string,
+  voiceChannel: VoiceBasedChannel
+) {
+  let player = shoukaku.players.get(guildId);
+
+  if (!player) {
+    player = await shoukaku.joinVoiceChannel({
+      guildId,
+      shardId: 0,
+      channelId: voiceChannel.id,
+      deaf: true,
+    });
+  }
+
+  return player;
+}
+
 export async function playSong(
   shoukaku: Shoukaku,
   guildId: string,
@@ -25,6 +44,8 @@ export async function playSong(
       ? query
       : `ytsearch:${query}`;
 
+    console.log("🎵 Buscando:", identifier);
+
     const result = await node.rest.resolve(identifier);
 
     if (!result || result.loadType === "empty") {
@@ -32,6 +53,7 @@ export async function playSong(
     }
 
     if (result.loadType === "error") {
+      console.error(result.data);
       return textChannel.send("❌ Error buscando la canción.");
     }
 
@@ -47,25 +69,23 @@ export async function playSong(
         break;
 
       case "playlist":
-        track = result.data.tracks?.[0] ?? null;
+        track = (result.data as any).tracks?.[0] ?? null;
         break;
     }
 
-    if (!track || !track.encoded) {
+    if (!track) {
       return textChannel.send("❌ Track inválido.");
     }
 
+    const player = await getOrCreatePlayer(
+      shoukaku,
+      guildId,
+      voiceChannel
+    );
+
     let queue = queues.get(guildId);
 
-    // 🎧 crear player si no existe
     if (!queue) {
-      const player = await shoukaku.joinVoiceChannel({
-        guildId,
-        channelId: voiceChannel.id,
-        shardId: 0,
-        deaf: true,
-      });
-
       queue = {
         player,
         tracks: [],
@@ -74,31 +94,32 @@ export async function playSong(
 
       queues.set(guildId, queue);
 
-      // 🔥 EVENTOS AUTO NEXT
-      player.on("end", () => {
-        playNext(shoukaku, guildId, textChannel);
+      player.on("closed", () => {
+        console.log("⚠ Player cerrado");
+        queues.delete(guildId);
       });
 
-      player.on("exception", () => {
-        playNext(shoukaku, guildId, textChannel);
+      player.on("exception", (data) => {
+        console.error("❌ Player exception:", data);
       });
     }
 
     queue.tracks.push({ track });
 
-    textChannel.send(`➕ Añadido: **${track.info?.title}**`);
+    await textChannel.send(`➕ Añadido: **${track.info.title}**`);
 
+    // 🎯 si no está reproduciendo → iniciar
     if (!queue.playing) {
       await playNext(shoukaku, guildId, textChannel);
     }
   } catch (err) {
-    console.error("playSong error:", err);
-    textChannel.send("❌ Error reproduciendo música.");
+    console.error("❌ playSong error:", err);
+    await textChannel.send("❌ Error reproduciendo música.");
   }
 }
 
 /**
- * ▶ NEXT SONG (CORE ENGINE)
+ * 🔥 LOOP ESTABLE DE REPRODUCCIÓN
  */
 export async function playNext(
   shoukaku: Shoukaku,
@@ -112,37 +133,60 @@ export async function playNext(
 
   if (!next) {
     queue.playing = false;
-    textChannel.send("📭 Cola vacía.");
+
+    await textChannel.send("📭 Cola vacía.");
+
+    try {
+      await queue.player.destroy();
+    } catch {}
+
+    queues.delete(guildId);
     return;
   }
 
   queue.playing = true;
 
   try {
+    console.log("▶ Reproduciendo:", next.track.info.title);
+
     await queue.player.playTrack({
-      track: next.track.encoded,
+      track: {
+        encoded: next.track.encoded,
+      },
     });
 
-    textChannel.send(`🎵 Reproduciendo: **${next.track.info?.title}**`);
+    await textChannel.send(
+      `🎵 Reproduciendo: **${next.track.info.title}**`
+    );
+
+    // 🔥 CLAVE: esperar fin REAL del track
+    await new Promise<void>((resolve) => {
+      const onEnd = () => {
+        queue.player.removeListener("end", onEnd as any);
+        resolve();
+      };
+
+      queue.player.on("end", onEnd as any);
+    });
+
+    // 🔁 siguiente canción automáticamente
+    await playNext(shoukaku, guildId, textChannel);
+
   } catch (err) {
-    console.error("playNext error:", err);
-    playNext(shoukaku, guildId, textChannel);
+    console.error("❌ playNext error:", err);
+
+    queue.playing = false;
+    await playNext(shoukaku, guildId, textChannel);
   }
 }
 
-/**
- * ⏭ SKIP
- */
 export async function skipSong(guildId: string) {
   const queue = queues.get(guildId);
   if (!queue) return;
 
-  queue.player.stopTrack(); // dispara "end"
+  await queue.player.stopTrack();
 }
 
-/**
- * ⏹ STOP
- */
 export async function stopSong(guildId: string) {
   const queue = queues.get(guildId);
   if (!queue) return;
@@ -151,15 +195,12 @@ export async function stopSong(guildId: string) {
   queue.playing = false;
 
   try {
-    queue.player.connection.disconnect();
+    await queue.player.destroy();
   } catch {}
 
   queues.delete(guildId);
 }
 
-/**
- * 📜 GET QUEUE
- */
 export function getQueue(guildId: string) {
   const queue = queues.get(guildId);
 
@@ -168,6 +209,6 @@ export function getQueue(guildId: string) {
   }
 
   return queue.tracks
-    .map((t, i) => `${i + 1}. ${t.track.info?.title}`)
+    .map((t, i) => `${i + 1}. ${t.track.info.title}`)
     .join("\n");
 }

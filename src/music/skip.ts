@@ -1,48 +1,31 @@
-import { queues } from "./queue";
-import { Shoukaku } from "shoukaku";
-import { TextChannel } from "discord.js";
-import { playNext } from "./player";
+import {
+  SlashCommandBuilder,
+  ChatInputCommandInteraction,
+} from "discord.js";
 
-/**
- * ⏭ Skip de canción
- */
-export async function skipSong(
-  shoukaku: Shoukaku,
-  guildId: string,
-  textChannel: TextChannel
+export const data = new SlashCommandBuilder()
+  .setName("skip")
+  .setDescription("Salta la canción actual");
+
+export async function execute(
+  interaction: ChatInputCommandInteraction,
+  skipSong: any,
+  shoukaku: any
 ) {
-  const queue = queues.get(guildId);
+  const guildId = interaction.guildId;
 
-  if (!queue) {
-    return textChannel.send("📭 No hay nada reproduciéndose.");
+  if (!guildId) {
+    return interaction.reply({
+      content: "❌ Este comando solo funciona en servidores.",
+      ephemeral: true,
+    });
   }
 
-  // 🧠 Si no hay más canciones en cola
-  if (queue.tracks.length === 0) {
-    try {
-      await queue.player.stopTrack();
-    } catch {}
+  await skipSong(
+    shoukaku,
+    guildId,
+    interaction.channel as any
+  );
 
-    queue.playing = false;
-
-    await textChannel.send("📭 No hay más canciones en la cola.");
-
-    // opcional: desconectar
-    try {
-      await queue.player.destroy();
-    } catch {}
-
-    queues.delete(guildId);
-    return;
-  }
-
-  await textChannel.send("⏭ Saltando canción...");
-
-  // 🔥 fuerza terminar la canción actual
-  try {
-    await queue.player.stopTrack();
-  } catch {}
-
-  // 🔁 reproduce la siguiente
-  await playNext(shoukaku, guildId, textChannel);
+  await interaction.reply("⏭ Saltando canción...");
 }

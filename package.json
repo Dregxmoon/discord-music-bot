@@ -22,9 +22,12 @@
     "@discordjs/voice": "^0.19.2",
     "discord.js": "^14.26.4",
     "dotenv": "^17.4.2",
+    "node-fetch": "^2.7.0",
     "opusscript": "^0.1.1",
     "play-dl": "^1.9.7",
-    "shoukaku": "^4.3.0"
+    "shoukaku": "^4.3.0",
+    "spotify-url-info": "^3.3.0",
+    "spotify-web-api-node": "^5.0.2"
   },
   "devDependencies": {
     "@types/node": "^25.9.0",

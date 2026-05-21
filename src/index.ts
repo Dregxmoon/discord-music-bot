@@ -1,3 +1,5 @@
+(global as any).fetch = require("node-fetch");
+
 import {
   Client,
   GatewayIntentBits,
@@ -97,10 +99,15 @@ client.on("interactionCreate", async (interaction: Interaction) => {
       }
 
       case "skip": {
-        await skipSong(interaction.guildId!);
-        await interaction.reply("⏭ Saltando...");
-        break;
-      }
+  await skipSong(
+    lavalink,
+    interaction.guildId!,
+    interaction.channel as TextChannel
+  );
+
+  await interaction.reply("⏭ Saltando canción...");
+  break;
+}
 
       case "stop": {
         await stopSong(interaction.guildId!);

@@ -1,4 +1,5 @@
-(global as any).fetch = require("node-fetch");
+// NOTA: Ya NO se necesita el polyfill global de node-fetch aquí.
+// player.ts importa node-fetch directamente y lo pasa a spotify-url-info.
 
 import {
   Client,
@@ -32,13 +33,9 @@ let lavalink: Shoukaku;
 
 async function start() {
   console.log("🚀 Iniciando bot...");
-
   await client.login(process.env.DISCORD_TOKEN);
-
   console.log(`✅ Logeado como ${client.user?.tag}`);
-
   lavalink = createLavalinkClient(client);
-
   console.log("🧩 Shoukaku creado");
 }
 
@@ -57,35 +54,22 @@ client.on("interactionCreate", async (interaction: Interaction) => {
       }
 
       case "play": {
-        const member = interaction.guild?.members.cache.get(
-          interaction.user.id
-        );
-
+        const member = interaction.guild?.members.cache.get(interaction.user.id);
         const voiceChannel = member?.voice.channel;
 
         if (!voiceChannel) {
-          await interaction.reply({
-            content: "❌ Debes estar en un canal de voz.",
-            ephemeral: true,
-          });
-
+          await interaction.reply({ content: "❌ Debes estar en un canal de voz.", ephemeral: true });
           return;
         }
 
         const query = interaction.options.get("query")?.value as string;
-
         if (!query) {
-          await interaction.reply({
-            content: "❌ Debes indicar una canción.",
-            ephemeral: true,
-          });
-
+          await interaction.reply({ content: "❌ Debes indicar una canción.", ephemeral: true });
           return;
         }
 
         await interaction.deferReply();
-
-        await interaction.editReply(`🎵 Buscando: ${query}`);
+        await interaction.editReply(`🔎 Buscando: ${query}`);
 
         await playSong(
           lavalink,
@@ -99,15 +83,14 @@ client.on("interactionCreate", async (interaction: Interaction) => {
       }
 
       case "skip": {
-  await skipSong(
-    lavalink,
-    interaction.guildId!,
-    interaction.channel as TextChannel
-  );
-
-  await interaction.reply("⏭ Saltando canción...");
-  break;
-}
+        await skipSong(
+          lavalink,
+          interaction.guildId!,
+          interaction.channel as TextChannel
+        );
+        await interaction.reply("⏭ Saltando canción...");
+        break;
+      }
 
       case "stop": {
         await stopSong(interaction.guildId!);
@@ -125,16 +108,11 @@ client.on("interactionCreate", async (interaction: Interaction) => {
     console.error(err);
 
     if (interaction.isRepliable()) {
+      const msg = { content: "❌ Error ejecutando comando.", ephemeral: true };
       if (interaction.deferred || interaction.replied) {
-        await interaction.followUp({
-          content: "❌ Error ejecutando comando.",
-          ephemeral: true,
-        });
+        await interaction.followUp(msg);
       } else {
-        await interaction.reply({
-          content: "❌ Error ejecutando comando.",
-          ephemeral: true,
-        });
+        await interaction.reply(msg);
       }
     }
   }

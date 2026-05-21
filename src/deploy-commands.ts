@@ -6,14 +6,15 @@ import { REST, Routes, SlashCommandBuilder } from "discord.js";
 const commands = [
   new SlashCommandBuilder()
     .setName("ping")
-    .setDescription("Responde con Pong!"),
+    .setDescription("Comprueba si el bot responde"),
 
   new SlashCommandBuilder()
     .setName("play")
-    .setDescription("Reproduce una canción")
+    .setDescription("Reproduce una canción o playlist")
     .addStringOption((opt) =>
-      opt.setName("query")
-        .setDescription("URL o nombre de la canción")
+      opt
+        .setName("query")
+        .setDescription("URL de YouTube/Spotify o nombre de canción")
         .setRequired(true)
     ),
 
@@ -27,7 +28,15 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName("queue")
-    .setDescription("Muestra la cola de canciones"),
+    .setDescription("Muestra las canciones en cola"),
+
+  new SlashCommandBuilder()
+    .setName("shuffle")
+    .setDescription("Activa o desactiva el modo aleatorio 🔀"),
+
+  new SlashCommandBuilder()
+    .setName("loopplaylist")
+    .setDescription("Activa o desactiva el loop infinito 🔁"),
 
 ].map((cmd) => cmd.toJSON());
 
@@ -35,7 +44,7 @@ const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN!);
 
 async function deployCommands() {
   try {
-    console.log("🔄 Registrando comandos...");
+    console.log("🔄 Registrando comandos slash...");
 
     await rest.put(
       Routes.applicationGuildCommands(
@@ -45,9 +54,12 @@ async function deployCommands() {
       { body: commands }
     );
 
-    console.log("✅ Comandos registrados:", commands.map((c) => `/${c.name}`).join(", "));
+    console.log(
+      "✅ Comandos registrados:\n" +
+      commands.map((c) => `   /${c.name} — ${c.description}`).join("\n")
+    );
   } catch (error) {
-    console.error("❌ Error:", error);
+    console.error("❌ Error registrando comandos:", error);
   }
 }
 

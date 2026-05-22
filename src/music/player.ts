@@ -1,92 +1,174 @@
 import { Shoukaku, Track, Player } from "shoukaku";
-import { TextChannel, VoiceBasedChannel } from "discord.js";
+import { Client, TextChannel, VoiceBasedChannel } from "discord.js";
 import { queues, GuildQueue, QueueItem, SpotifyMeta } from "./queue";
-
-const nodeFetch = require("node-fetch");
-
-const { getData: spotifyGetData, getTracks: spotifyGetTracks } =
-  require("spotify-url-info")(nodeFetch);
+import { resolveSpotifyUrl } from "./spotify";
 
 // ─────────────────────────────────────────────
-// CONSTANTS
+// CONSTANTES
 // ─────────────────────────────────────────────
+
+const MAX_QUEUE_SIZE      = 100;
+const AUTO_DISCONNECT_MS  = 3 * 60 * 1000; // 3 minutos sin actividad → desconectar
+
+// ─────────────────────────────────────────────
+// CACHÉ DE RESOLUCIONES
+// Evita llamar a Lavalink dos veces por la misma query.
+// Clave: query string → Track resuelto
+// TTL: 30 minutos (las URLs de YouTube expiran)
+// ─────────────────────────────────────────────
+
+interface CacheEntry {
+  track:     Track;
+  expiresAt: number;
+}
+
+const resolveCache = new Map<string, CacheEntry>();
+const CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutos
+
+function cacheGet(key: string): Track | null {
+  const entry = resolveCache.get(key);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) {
+    resolveCache.delete(key);
+    return null;
+  }
+  return entry.track;
+}
+
+function cacheSet(key: string, track: Track): void {
+  resolveCache.set(key, { track, expiresAt: Date.now() + CACHE_TTL_MS });
+}
+
+// Limpia entradas expiradas cada 10 minutos para no acumular memoria
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of resolveCache) {
+    if (now > entry.expiresAt) resolveCache.delete(key);
+  }
+}, 10 * 60 * 1000);
+
+// ─────────────────────────────────────────────
+// AUTO-DISCONNECT
+// Timer por servidor — se activa cuando el canal de voz
+// queda vacío o la cola se vacía. Se cancela si alguien
+// vuelve o se añade música.
+// ─────────────────────────────────────────────
+
+const disconnectTimers = new Map<string, NodeJS.Timeout>();
+
+function scheduleDisconnect(
+  guildId: string,
+  shoukaku: Shoukaku,
+  textChannel: TextChannel
+): void {
+  cancelDisconnect(guildId); // cancela cualquier timer anterior
+
+  const timer = setTimeout(async () => {
+    const queue = queues.get(guildId);
+
+    // Solo desconecta si sigue sin reproducir
+    if (queue && queue.playing) return;
+
+    console.log(`[AutoDisconnect] Desconectando guild ${guildId} por inactividad`);
+    await textChannel.send("💤 Sin actividad — desconectando. ¡Hasta pronto!");
+    await cleanupGuild(guildId, shoukaku);
+  }, AUTO_DISCONNECT_MS);
+
+  disconnectTimers.set(guildId, timer);
+}
+
+function cancelDisconnect(guildId: string): void {
+  const timer = disconnectTimers.get(guildId);
+  if (timer) {
+    clearTimeout(timer);
+    disconnectTimers.delete(guildId);
+  }
+}
 
 /**
- * Límite real de spotify-url-info: usa la API pública de Spotify
- * que devuelve máximo 100 tracks por playlist sin credenciales.
- * Para superar esto necesitarías la Spotify Web API oficial con
- * CLIENT_ID + CLIENT_SECRET y paginación manual.
+ * Llama a esto desde index.ts cuando detectes que el bot
+ * quedó solo en el canal de voz (evento voiceStateUpdate).
  */
-const SPOTIFY_MAX_TRACKS = 100;
+export function onVoiceChannelEmpty(
+  guildId: string,
+  shoukaku: Shoukaku,
+  textChannel: TextChannel
+): void {
+  const queue = queues.get(guildId);
+  if (!queue) return;
 
-const ARTIST_BLACKLIST = [
-  "playlist", "spotify", "album", "single", "ep",
-  "compilation", "various artists", "varios artistas",
-];
+  // Pausa la reproducción si estaba sonando
+  if (queue.playing && !queue.paused) {
+    queue.player.setPaused(true).catch(() => {});
+    queue.pausedAt = Date.now() - queue.startedAt;
+    queue.paused   = true;
+  }
 
-const LOOKS_LIKE_USERNAME = /^[A-Z][a-z]+[A-Z][a-z]+\d*$|^\w{3,}\d{3,}$/;
+  scheduleDisconnect(guildId, shoukaku, textChannel);
+}
+
+/**
+ * Llama a esto cuando alguien vuelve al canal de voz.
+ */
+export function onVoiceChannelJoined(guildId: string): void {
+  cancelDisconnect(guildId);
+
+  const queue = queues.get(guildId);
+  if (!queue) return;
+
+  // Reanuda si estaba pausado por el auto-disconnect
+  if (queue.paused) {
+    queue.player.setPaused(false).catch(() => {});
+    queue.startedAt = Date.now() - queue.pausedAt;
+    queue.pausedAt  = 0;
+    queue.paused    = false;
+  }
+}
 
 // ─────────────────────────────────────────────
-// SPOTIFY WRAPPER
+// PREFERENCIAS POR SERVIDOR
 // ─────────────────────────────────────────────
 
-async function getSpotifyInfo(
-  url: string
-): Promise<{ name: string; tracks: any[]; total: number }> {
-  const [tracks, meta] = await Promise.all([
-    spotifyGetTracks(url),
-    spotifyGetData(url).catch(() => ({})),
-  ]);
+const guildPrefs = new Map<string, { shuffle: boolean; loop: boolean; volume: number }>();
 
-  const arr = Array.isArray(tracks) ? tracks : [];
-
-  return {
-    name: meta?.name ?? meta?.title ?? "Spotify",
-    tracks: arr,
-    // total real de la playlist (puede ser >100, solo informativo)
-    total: meta?.tracks?.total ?? meta?.total ?? arr.length,
-  };
+function getPrefs(guildId: string) {
+  if (!guildPrefs.has(guildId)) {
+    guildPrefs.set(guildId, { shuffle: false, loop: false, volume: 100 });
+  }
+  return guildPrefs.get(guildId)!;
 }
 
 // ─────────────────────────────────────────────
 // METADATA HELPERS
 // ─────────────────────────────────────────────
 
-function isValidArtist(value: unknown): value is string {
-  if (!value || typeof value !== "string") return false;
-  const s = value.trim();
-  if (s.length < 2) return false;
-  const lower = s.toLowerCase();
-  if (ARTIST_BLACKLIST.some((bad) => lower.includes(bad))) return false;
-  if (LOOKS_LIKE_USERNAME.test(s)) return false;
-  return true;
-}
-
-function extractArtist(trackData: any): string {
-  if (Array.isArray(trackData?.artists)) {
-    const names = trackData.artists
-      .map((a: any) => (typeof a === "string" ? a : a?.name))
-      .filter(isValidArtist) as string[];
-    if (names.length > 0) return names.slice(0, 2).join(" ");
-  }
-  if (isValidArtist(trackData?.artist)) return trackData.artist.trim();
-  if (isValidArtist(trackData?.subtitle)) return trackData.subtitle.trim();
-  return "";
-}
-
-function extractMeta(trackData: any): SpotifyMeta | null {
-  const name = (trackData?.name ?? trackData?.title ?? "").trim();
-  if (!name) return null;
-  return { name, artist: extractArtist(trackData) };
-}
-
 function buildSearchQuery(meta: SpotifyMeta): string {
   const combined = meta.artist ? `${meta.name} ${meta.artist}` : meta.name;
   return `ytsearch:${combined}`;
 }
 
+export function formatDuration(ms: number): string {
+  const totalSec = Math.floor(ms / 1000);
+  const h = Math.floor(totalSec / 3600);
+  const m = Math.floor((totalSec % 3600) / 60);
+  const s = totalSec % 60;
+  if (h > 0) return `${h}:${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
+  return `${m}:${s.toString().padStart(2, "0")}`;
+}
+
+export function buildProgressBar(current: number, total: number, size = 16): string {
+  const pct    = Math.min(current / total, 1);
+  const filled = Math.round(pct * size);
+  const empty  = size - filled;
+  return (
+    "▬".repeat(Math.max(filled - 1, 0)) +
+    (filled > 0 ? "●" : "") +
+    "─".repeat(empty)
+  );
+}
+
 // ─────────────────────────────────────────────
-// LAVALINK RESOLUTION
+// LAVALINK RESOLUTION (con caché)
 // ─────────────────────────────────────────────
 
 function getNode(shoukaku: Shoukaku) {
@@ -100,6 +182,13 @@ async function resolveQuery(
   query: string,
   fallback?: string
 ): Promise<Track | null> {
+  // Revisar caché primero
+  const cached = cacheGet(query);
+  if (cached) {
+    console.log(`[Cache] Hit: ${query}`);
+    return cached;
+  }
+
   const node = getNode(shoukaku);
 
   const attempt = async (q: string): Promise<Track | null> => {
@@ -107,8 +196,8 @@ async function resolveQuery(
       const result = await node.rest.resolve(q);
       if (!result) return null;
       if (result.loadType === "empty" || result.loadType === "error") return null;
-      if (result.loadType === "track") return result.data as Track;
-      if (result.loadType === "search") return (result.data as Track[])[0] ?? null;
+      if (result.loadType === "track")    return result.data as Track;
+      if (result.loadType === "search")   return (result.data as Track[])[0] ?? null;
       if (result.loadType === "playlist") return (result.data as any).tracks?.[0] ?? null;
     } catch (err) {
       console.error(`[resolveQuery] Error con "${q}":`, err);
@@ -116,22 +205,36 @@ async function resolveQuery(
     return null;
   };
 
-  const track = await attempt(query);
-  if (track) return track;
+  // Hasta 3 reintentos
+  for (let i = 0; i < 3; i++) {
+    const track = await attempt(query);
+    if (track) {
+      cacheSet(query, track); // guardar en caché
+      return track;
+    }
+    if (i < 2) await new Promise((r) => setTimeout(r, 500));
+  }
 
+  // Fallback
   if (fallback && fallback !== query) {
+    const cachedFallback = cacheGet(fallback);
+    if (cachedFallback) return cachedFallback;
+
     console.warn(`[resolveQuery] Fallback: ${fallback}`);
-    return attempt(fallback);
+    for (let i = 0; i < 2; i++) {
+      const track = await attempt(fallback);
+      if (track) {
+        cacheSet(fallback, track);
+        return track;
+      }
+      if (i < 1) await new Promise((r) => setTimeout(r, 500));
+    }
   }
 
   return null;
 }
 
-/** Resuelve un QueueItem pendiente contra Lavalink */
-async function resolveItem(
-  shoukaku: Shoukaku,
-  item: QueueItem
-): Promise<Track | null> {
+async function resolveItem(shoukaku: Shoukaku, item: QueueItem): Promise<Track | null> {
   if (item.track) return item.track;
   if (!item.pending) return null;
   return resolveQuery(
@@ -159,7 +262,7 @@ function randomIndex(max: number): number {
 }
 
 // ─────────────────────────────────────────────
-// PLAYER + QUEUE INIT
+// PLAYER CREATION
 // ─────────────────────────────────────────────
 
 async function getOrCreatePlayer(
@@ -167,8 +270,15 @@ async function getOrCreatePlayer(
   guildId: string,
   voiceChannel: VoiceBasedChannel
 ): Promise<Player> {
-  const existing = shoukaku.players.get(guildId);
-  if (existing) return existing;
+  const stale = shoukaku.players.get(guildId);
+
+  if (stale) {
+    if (queues.has(guildId)) return stale;
+    console.log(`[Player] Limpiando player zombie de guild ${guildId}`);
+    try { await shoukaku.leaveVoiceChannel(guildId); } catch {}
+    await new Promise((r) => setTimeout(r, 500));
+  }
+
   return shoukaku.joinVoiceChannel({
     guildId,
     shardId: 0,
@@ -176,6 +286,10 @@ async function getOrCreatePlayer(
     deaf: true,
   });
 }
+
+// ─────────────────────────────────────────────
+// QUEUE INIT
+// ─────────────────────────────────────────────
 
 function initQueue(
   shoukaku: Shoukaku,
@@ -186,34 +300,76 @@ function initQueue(
   const existing = queues.get(guildId);
   if (existing) return existing;
 
+  const prefs = getPrefs(guildId);
+
   const queue: GuildQueue = {
     player,
-    tracks: [],
-    history: [],
-    playing: false,
-    shuffle: false,
-    loop: false,
+    tracks:       [],
+    history:      [],
+    playing:      false,
+    shuffle:      prefs.shuffle,
+    loop:         prefs.loop,
+    currentTrack: null,
+    startedAt:    0,
+    pausedAt:     0,
+    paused:       false,
   };
 
   queues.set(guildId, queue);
 
-  // Eventos registrados UNA sola vez por guild
   player.on("end", async () => {
     const q = queues.get(guildId);
     if (!q) return;
-    q.playing = false;
+    q.playing      = false;
+    q.currentTrack = null;
+    q.paused       = false;
+    cancelDisconnect(guildId);
     await playNext(shoukaku, guildId, textChannel);
   });
 
   player.on("exception", async (data) => {
-    console.error(`[Player:${guildId}] Exception:`, data);
     const q = queues.get(guildId);
-    if (!q) return;
-    q.playing = false;
+    if (!q || !q.playing) return;
+
+    const title = (data as any)?.track?.info?.title ?? "desconocida";
+    console.warn(`[Player:${guildId}] Track no disponible, saltando: ${title}`);
+
+    q.playing      = false;
+    q.currentTrack = null;
+    q.paused       = false;
+
     await playNext(shoukaku, guildId, textChannel);
   });
 
   return queue;
+}
+
+// ─────────────────────────────────────────────
+// CLEANUP
+// ─────────────────────────────────────────────
+
+async function cleanupGuild(
+  guildId: string,
+  shoukaku?: Shoukaku
+): Promise<void> {
+  cancelDisconnect(guildId);
+
+  const queue = queues.get(guildId);
+  queues.delete(guildId);
+
+  if (queue) {
+    queue.playing      = false;
+    queue.tracks       = [];
+    queue.history      = [];
+    queue.currentTrack = null;
+    queue.paused       = false;
+  }
+
+  if (shoukaku) {
+    try { await shoukaku.leaveVoiceChannel(guildId); } catch {}
+  } else if (queue) {
+    try { await queue.player.destroy(); } catch {}
+  }
 }
 
 // ─────────────────────────────────────────────
@@ -228,51 +384,43 @@ export async function playSong(
   query: string
 ): Promise<void> {
   try {
+    cancelDisconnect(guildId); // alguien usó /play → cancelar cualquier timer de inactividad
+
     const player = await getOrCreatePlayer(shoukaku, guildId, voiceChannel);
-    const queue = initQueue(shoukaku, guildId, player, textChannel);
+    const queue  = initQueue(shoukaku, guildId, player, textChannel);
 
     // ─── SPOTIFY ────────────────────────────────────────────────────────
     if (query.includes("spotify.com")) {
-      await textChannel.send("🎧 Leyendo Spotify...");
+      await textChannel.send("🎧 Conectando con Spotify...");
 
-      let info: { name: string; tracks: any[]; total: number };
+      let info: Awaited<ReturnType<typeof resolveSpotifyUrl>>;
       try {
-        info = await getSpotifyInfo(query);
+        info = await resolveSpotifyUrl(query);
       } catch (err) {
         console.error("[Spotify] Error:", err);
         await textChannel.send("❌ No se pudo leer el enlace de Spotify.");
         return;
       }
 
-      const { name: playlistName, tracks: rawTracks, total } = info;
+      const { name: resourceName, total, tracks: allMetas } = info;
 
-      if (rawTracks.length === 0) {
+      if (allMetas.length === 0) {
         await textChannel.send("❌ No se encontraron canciones.");
         return;
       }
 
-      const isPlaylist = rawTracks.length > 1;
+      const limited    = allMetas.slice(0, MAX_QUEUE_SIZE);
+      const isPlaylist = limited.length > 1;
+      const wasLimited = allMetas.length > MAX_QUEUE_SIZE;
 
-      // Avisa si la playlist tiene más de 100 canciones
-      const limitWarning =
-        total > SPOTIFY_MAX_TRACKS
-          ? `\n⚠️ La playlist tiene **${total}** canciones pero solo se pueden cargar las primeras **${SPOTIFY_MAX_TRACKS}** ` +
-            `(limitación de la API pública de Spotify).`
-          : "";
-
-      // ── SHUFFLE ACTIVO: elige 1 random y encola el resto aleatorio ──────
       if (queue.shuffle && isPlaylist) {
-        const idx = randomIndex(rawTracks.length);
-        const chosenMeta = extractMeta(rawTracks[idx]);
-
-        if (!chosenMeta) {
-          await textChannel.send("❌ No se pudo extraer la canción aleatoria.");
-          return;
-        }
+        const idx        = randomIndex(limited.length);
+        const chosenMeta = limited[idx];
 
         await textChannel.send(
-          `🔀 Shuffle ON — **${playlistName}** (${rawTracks.length} cargadas de ${total} totales)` +
-          limitWarning +
+          `🔀 Shuffle ON — **${resourceName}**\n` +
+          `📋 ${limited.length} canciones` +
+          (wasLimited ? ` (máx. ${MAX_QUEUE_SIZE} de ${total})` : "") +
           `\n🎲 Eligió: **${chosenMeta.name}**...`
         );
 
@@ -287,45 +435,29 @@ export async function playSong(
           return;
         }
 
-        // El resto en orden aleatorio, todos lazy (pending)
         const restItems: QueueItem[] = shuffleArray(
-          rawTracks.filter((_, i) => i !== idx)
-        )
-          .map((t) => {
-            const m = extractMeta(t);
-            return m ? ({ pending: m } as QueueItem) : null;
-          })
-          .filter(Boolean) as QueueItem[];
+          limited.filter((_, i) => i !== idx)
+        ).map((m) => ({ pending: m } as QueueItem));
 
         const firstItem: QueueItem = { track: firstTrack };
         queue.tracks.push(firstItem, ...restItems);
         queue.history.push(firstItem, ...restItems);
 
-        await textChannel.send(
-          `✅ Reproduciendo **${chosenMeta.name}** + ${restItems.length} canciones más en cola.`
-        );
-
+        await textChannel.send(`✅ **${chosenMeta.name}** + ${restItems.length} más en cola.`);
         if (!queue.playing) await playNext(shoukaku, guildId, textChannel);
         return;
       }
 
-      // ── NORMAL: reproduce la primera ahora, el resto lazy ───────────────
-      const firstMeta = extractMeta(rawTracks[0]);
-
-      if (!firstMeta) {
-        await textChannel.send("❌ No se pudo extraer la primera canción.");
-        return;
-      }
+      const firstMeta = limited[0];
 
       await textChannel.send(
         isPlaylist
-          ? `📋 **${playlistName}** — ${rawTracks.length} cargadas de ${total} totales` +
-            limitWarning +
+          ? `📋 **${resourceName}** — ${limited.length} canciones` +
+            (wasLimited ? ` (máx. ${MAX_QUEUE_SIZE} de ${total})` : "") +
             `\n▶️ Arrancando: **${firstMeta.name}**...`
           : `🔎 Buscando: **${firstMeta.name}**...`
       );
 
-      // Resuelve solo la #1 para arrancar sin esperar
       const firstTrack = await resolveQuery(
         shoukaku,
         buildSearchQuery(firstMeta),
@@ -342,20 +474,13 @@ export async function playSong(
       queue.history.push(firstItem);
 
       if (isPlaylist) {
-        // El resto va como pending — se resuelve justo antes de reproducirse
-        const restItems: QueueItem[] = rawTracks
+        const restItems: QueueItem[] = limited
           .slice(1)
-          .map((t) => {
-            const m = extractMeta(t);
-            return m ? ({ pending: m } as QueueItem) : null;
-          })
-          .filter(Boolean) as QueueItem[];
-
+          .map((m) => ({ pending: m } as QueueItem));
         queue.tracks.push(...restItems);
         queue.history.push(...restItems);
-
         await textChannel.send(
-          `✅ **${firstMeta.name}** reproduciéndose + ${restItems.length} canciones más en cola.`
+          `✅ **${firstMeta.name}** reproduciéndose + ${restItems.length} más en cola.`
         );
       }
 
@@ -365,7 +490,7 @@ export async function playSong(
 
     // ─── YOUTUBE / BÚSQUEDA NORMAL ──────────────────────────────────────
     const identifier = /^https?:\/\//.test(query) ? query : `ytsearch:${query}`;
-    const resolved = await resolveQuery(shoukaku, identifier);
+    const resolved   = await resolveQuery(shoukaku, identifier);
 
     if (!resolved) {
       await textChannel.send("❌ No se encontró ningún resultado.");
@@ -386,7 +511,7 @@ export async function playSong(
 }
 
 // ─────────────────────────────────────────────
-// PLAY NEXT — con lazy resolution
+// PLAY NEXT
 // ─────────────────────────────────────────────
 
 export async function playNext(
@@ -397,14 +522,12 @@ export async function playNext(
   const queue = queues.get(guildId);
   if (!queue) return;
 
-  // Loop: recarga la cola desde el historial
   if (queue.tracks.length === 0 && queue.loop && queue.history.length > 0) {
     queue.tracks = queue.shuffle
       ? shuffleArray([...queue.history])
       : [...queue.history];
   }
 
-  // Shuffle dinámico: elige un item random como siguiente
   if (queue.shuffle && queue.tracks.length > 1) {
     const idx = randomIndex(queue.tracks.length);
     const [chosen] = queue.tracks.splice(idx, 1);
@@ -414,15 +537,13 @@ export async function playNext(
   const next = queue.tracks.shift();
 
   if (!next) {
-    queue.playing = false;
     await textChannel.send("📭 Cola vacía. ¡Hasta la próxima!");
-    try { await queue.player.destroy(); } catch {}
-    queues.delete(guildId);
+    // Programa desconexión en vez de desconectar inmediatamente
+    // por si el usuario quiere añadir más canciones rápidamente
+    scheduleDisconnect(guildId, shoukaku, textChannel);
     return;
   }
 
-  // ── LAZY RESOLUTION ───────────────────────────────────────────────────
-  // Si el item es pending, lo resolvemos AHORA (justo antes de reproducir)
   let track: Track | null = null;
 
   if (next.track) {
@@ -435,7 +556,6 @@ export async function playNext(
     track = await resolveItem(shoukaku, next);
 
     if (!track) {
-      // No encontrado en YouTube: salta silenciosamente al siguiente
       console.warn(`[Lazy] No encontrado, saltando: ${label}`);
       queue.playing = false;
       return playNext(shoukaku, guildId, textChannel);
@@ -447,12 +567,16 @@ export async function playNext(
     return playNext(shoukaku, guildId, textChannel);
   }
 
-  queue.playing = true;
+  queue.playing      = true;
+  queue.currentTrack = track;
+  queue.startedAt    = Date.now();
+  queue.pausedAt     = 0;
+  queue.paused       = false;
 
   try {
     await queue.player.playTrack({ track: { encoded: track.encoded } });
 
-    const dur = track.info.length ? formatDuration(track.info.length) : "?";
+    const dur       = track.info.length ? formatDuration(track.info.length) : "?";
     const remaining = queue.tracks.length;
 
     await textChannel.send(
@@ -461,13 +585,14 @@ export async function playNext(
     );
   } catch (err) {
     console.error("[playNext] Error:", err);
-    queue.playing = false;
+    queue.playing      = false;
+    queue.currentTrack = null;
     await playNext(shoukaku, guildId, textChannel);
   }
 }
 
 // ─────────────────────────────────────────────
-// SKIP
+// SKIP / STOP / PAUSE / RESUME / SEEK
 // ─────────────────────────────────────────────
 
 export async function skipSong(
@@ -481,21 +606,86 @@ export async function skipSong(
     return;
   }
   await queue.player.stopTrack();
-  await textChannel.send("⏭ Canción saltada.");
+}
+
+export async function stopSong(
+  guildId: string,
+  shoukaku?: Shoukaku
+): Promise<void> {
+  await cleanupGuild(guildId, shoukaku);
+}
+
+export async function pauseSong(guildId: string): Promise<"paused" | "not_playing"> {
+  const queue = queues.get(guildId);
+  if (!queue || !queue.playing || queue.paused) return "not_playing";
+  await queue.player.setPaused(true);
+  queue.pausedAt = Date.now() - queue.startedAt;
+  queue.paused   = true;
+  return "paused";
+}
+
+export async function resumeSong(guildId: string): Promise<"resumed" | "not_paused"> {
+  const queue = queues.get(guildId);
+  if (!queue || !queue.paused) return "not_paused";
+  await queue.player.setPaused(false);
+  queue.startedAt = Date.now() - queue.pausedAt;
+  queue.pausedAt  = 0;
+  queue.paused    = false;
+  return "resumed";
+}
+
+export type SeekResult = "ok" | "not_playing" | "out_of_range" | "not_seekable";
+
+export async function seekSong(
+  guildId: string,
+  positionMs: number
+): Promise<SeekResult> {
+  const queue = queues.get(guildId);
+  if (!queue || !queue.playing || !queue.currentTrack) return "not_playing";
+  const track = queue.currentTrack;
+  if (track.info.isStream) return "not_seekable";
+  const duration = track.info.length ?? 0;
+  if (positionMs < 0 || positionMs > duration) return "out_of_range";
+  await queue.player.seekTo(positionMs);
+  queue.startedAt = Date.now() - positionMs;
+  queue.pausedAt  = 0;
+  return "ok";
 }
 
 // ─────────────────────────────────────────────
-// STOP
+// NOW PLAYING
 // ─────────────────────────────────────────────
 
-export async function stopSong(guildId: string): Promise<void> {
+export interface NowPlayingInfo {
+  title:     string;
+  author:    string;
+  uri:       string | null;
+  duration:  number;
+  position:  number;
+  paused:    boolean;
+  shuffle:   boolean;
+  loop:      boolean;
+  remaining: number;
+}
+
+export function getNowPlaying(guildId: string): NowPlayingInfo | null {
   const queue = queues.get(guildId);
-  if (!queue) return;
-  queue.tracks = [];
-  queue.history = [];
-  queue.playing = false;
-  try { await queue.player.destroy(); } catch {}
-  queues.delete(guildId);
+  if (!queue || !queue.currentTrack) return null;
+  const track   = queue.currentTrack;
+  const elapsed = queue.paused
+    ? queue.pausedAt
+    : Date.now() - queue.startedAt;
+  return {
+    title:     track.info.title,
+    author:    track.info.author,
+    uri:       track.info.uri ?? null,
+    duration:  track.info.length ?? 0,
+    position:  Math.min(elapsed, track.info.length ?? elapsed),
+    paused:    queue.paused,
+    shuffle:   queue.shuffle,
+    loop:      queue.loop,
+    remaining: queue.tracks.length,
+  };
 }
 
 // ─────────────────────────────────────────────
@@ -503,17 +693,23 @@ export async function stopSong(guildId: string): Promise<void> {
 // ─────────────────────────────────────────────
 
 export function toggleShuffle(guildId: string): boolean {
+  const prefs = getPrefs(guildId);
+  prefs.shuffle = !prefs.shuffle;
   const queue = queues.get(guildId);
-  if (!queue) return false;
-  queue.shuffle = !queue.shuffle;
-  return queue.shuffle;
+  if (queue) queue.shuffle = prefs.shuffle;
+  return prefs.shuffle;
 }
 
 export function toggleLoop(guildId: string): boolean {
+  const prefs = getPrefs(guildId);
+  prefs.loop = !prefs.loop;
   const queue = queues.get(guildId);
-  if (!queue) return false;
-  queue.loop = !queue.loop;
-  return queue.loop;
+  if (queue) queue.loop = prefs.loop;
+  return prefs.loop;
+}
+
+export function getShuffleState(guildId: string): boolean {
+  return queues.get(guildId)?.shuffle ?? getPrefs(guildId).shuffle;
 }
 
 // ─────────────────────────────────────────────
@@ -526,9 +722,7 @@ export function getQueue(guildId: string): string {
 
   const lines = queue.tracks.slice(0, 20).map((item, i) => {
     if (item.track) {
-      const dur = item.track.info.length
-        ? formatDuration(item.track.info.length)
-        : "?";
+      const dur = item.track.info.length ? formatDuration(item.track.info.length) : "?";
       return `\`${i + 1}.\` **${item.track.info.title}** \`[${dur}]\``;
     }
     if (item.pending) {
@@ -540,25 +734,9 @@ export function getQueue(guildId: string): string {
     return `\`${i + 1}.\` *(desconocido)*`;
   });
 
-  const extra =
-    queue.tracks.length > 20
-      ? `\n_...y ${queue.tracks.length - 20} más._`
-      : "";
+  const extra = queue.tracks.length > 20
+    ? `\n_...y ${queue.tracks.length - 20} más._`
+    : "";
 
-  return (
-    `🎶 **Cola (${queue.tracks.length} canciones):**\n` +
-    lines.join("\n") +
-    extra
-  );
-}
-
-// ─────────────────────────────────────────────
-// UTILITY
-// ─────────────────────────────────────────────
-
-function formatDuration(ms: number): string {
-  const totalSec = Math.floor(ms / 1000);
-  const m = Math.floor(totalSec / 60);
-  const s = totalSec % 60;
-  return `${m}:${s.toString().padStart(2, "0")}`;
+  return `🎶 **Cola (${queue.tracks.length} canciones):**\n${lines.join("\n")}${extra}`;
 }

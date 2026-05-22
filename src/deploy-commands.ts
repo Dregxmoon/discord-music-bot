@@ -12,8 +12,7 @@ const commands = [
     .setName("play")
     .setDescription("Reproduce una canción o playlist")
     .addStringOption((opt) =>
-      opt
-        .setName("query")
+      opt.setName("query")
         .setDescription("URL de YouTube/Spotify o nombre de canción")
         .setRequired(true)
     ),
@@ -24,11 +23,32 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName("stop")
-    .setDescription("Para la música y desconecta el bot"),
+    .setDescription("Para la música y limpia la cola"),
 
   new SlashCommandBuilder()
     .setName("queue")
     .setDescription("Muestra las canciones en cola"),
+
+  new SlashCommandBuilder()
+    .setName("nowplaying")
+    .setDescription("Muestra la canción actual con barra de progreso"),
+
+  new SlashCommandBuilder()
+    .setName("pause")
+    .setDescription("Pausa la canción actual"),
+
+  new SlashCommandBuilder()
+    .setName("resume")
+    .setDescription("Reanuda la canción pausada"),
+
+  new SlashCommandBuilder()
+    .setName("seek")
+    .setDescription("Salta a un momento específico de la canción")
+    .addStringOption((opt) =>
+      opt.setName("position")
+        .setDescription("Posición en formato 1:30 o en segundos (90)")
+        .setRequired(true)
+    ),
 
   new SlashCommandBuilder()
     .setName("shuffle")
